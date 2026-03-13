@@ -483,6 +483,15 @@ function Step-InstallPnpm {
         if ($pnpmVer) {
             Write-Ok "pnpm $pnpmVer 已安装，跳过安装步骤"
             Ensure-PnpmHome
+            $currentRegistry = try { (& $pnpmCmd config get registry 2>$null).Trim() } catch { "" }
+            if ($currentRegistry -notlike "*npmmirror*") {
+                try {
+                    & $pnpmCmd config set registry https://registry.npmmirror.com 2>$null
+                    Write-Ok "pnpm 镜像已设置为 https://registry.npmmirror.com"
+                } catch {
+                    Write-Warn "设置 pnpm 镜像失败，将使用默认源"
+                }
+            }
             return $true
         }
     } catch {}
@@ -498,6 +507,13 @@ function Step-InstallPnpm {
 
         Write-Info "正在配置 pnpm 全局路径 (pnpm setup)..."
         try { & $pnpmCmd setup 2>$null } catch { Write-Warn "pnpm setup 执行未成功，不影响后续安装" }
+
+        try {
+            & $pnpmCmd config set registry https://registry.npmmirror.com 2>$null
+            Write-Ok "pnpm 镜像已设置为 https://registry.npmmirror.com"
+        } catch {
+            Write-Warn "设置 pnpm 镜像失败，将使用默认源"
+        }
 
         Ensure-PnpmHome
         return $true
@@ -602,29 +618,8 @@ function Step-InstallOpenClaw {
         return $false
     }
 
-    # 第 1 轮：优先使用 bgithub.xyz 镜像
-    Write-Info "正在使用镜像加速安装..."
-    $preferredMirror = "https://bgithub.xyz/"
-    try {
-        Set-GitMirror $preferredMirror
-        $result = Run-PnpmInstall -PnpmCmd $pnpmCmd -Label "安装"
-        if ($result.Success) {
-            Clear-GitMirror $preferredMirror
-            Write-Ok "OpenClaw 安装完成"
-            return $true
-        }
-        if (Try-InstallWithCleanup $pnpmCmd ([ref]$result)) {
-            Clear-GitMirror $preferredMirror
-            Write-Ok "OpenClaw 安装完成"
-            return $true
-        }
-    } finally {
-        Clear-GitMirror $preferredMirror
-    }
-
-    # 第 2 轮：使用官方 GitHub 地址（不走镜像）
-    Write-Warn "镜像安装失败，正在使用 GitHub 官方地址重试..."
-    $result = Run-PnpmInstall -PnpmCmd $pnpmCmd -Label "官方源安装"
+    # 第 1 轮：使用官方 GitHub 地址（不走镜像）
+    $result = Run-PnpmInstall -PnpmCmd $pnpmCmd -Label "安装"
     if ($result.Success) {
         Write-Ok "OpenClaw 安装完成"
         return $true
@@ -634,9 +629,10 @@ function Step-InstallOpenClaw {
         return $true
     }
 
-    # 第 3 轮：依次尝试其他镜像
-    Write-Warn "官方地址也失败了，正在尝试其他镜像..."
+    # 第 2 轮：官方失败，依次尝试镜像
+    Write-Warn "官方源安装失败，正在尝试镜像加速..."
     $fallbackMirrors = @(
+        "https://bgithub.xyz/",
         "https://kkgithub.com/",
         "https://github.ur1.fun/",
         "https://ghproxy.net/https://github.com/",
