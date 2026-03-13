@@ -56,6 +56,14 @@
   },
   "redirects": [
     {
+      "source": "/install-openclaw.ps1",
+      "destination": "https://pic.code-nav.cn/openclaw_install/install-openclaw.ps1"
+    },
+    {
+      "source": "/install-openclaw.sh",
+      "destination": "https://pic.code-nav.cn/openclaw_install/install-openclaw.sh"
+    },
+    {
       "source": "/messages",
       "destination": "/concepts/messages"
     },
