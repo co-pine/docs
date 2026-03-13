@@ -6,11 +6,21 @@
 .NOTES
   用法:
     powershell -ExecutionPolicy Bypass -File install-openclaw.ps1
-  在线一键安装（推荐，显式 UTF-8 编码，兼容 PowerShell 5.x）:
-    powershell -c "$w=New-Object Net.WebClient;$w.Encoding=[Text.Encoding]::UTF8;iex $w.DownloadString('https://www.codefather.cn/openclaw_install/install-openclaw.ps1')"
-  在线一键安装（简短，需服务端返回 charset=utf-8 或文件含 BOM）:
-    irm https://www.clawfather.cn/install-openclaw.ps1 | iex
+  在线一键安装（推荐）:
+    powershell -NoProfile -c "& {$w=New-Object Net.WebClient;$w.Encoding=[Text.Encoding]::UTF8;iex $w.DownloadString('https://你的域名/install-openclaw.ps1')}"
 #>
+
+# ── 执行策略自修复：如果当前策略阻止脚本运行，自动以 Bypass 重启 ──
+if ($MyInvocation.MyCommand.Path) {
+    try {
+        $policy = Get-ExecutionPolicy -Scope Process
+        if ($policy -eq "Restricted" -or $policy -eq "AllSigned") {
+            Write-Host "  [INFO] 检测到执行策略为 $policy，正在以 Bypass 策略重新启动..." -ForegroundColor Blue
+            Start-Process -FilePath "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`"" -Wait -NoNewWindow
+            exit $LASTEXITCODE
+        }
+    } catch {}
+}
 
 # ── 强制 UTF-8 编码（解决中文乱码）──
 try { $null = & cmd /c "chcp 65001 >nul 2>&1" } catch {}
@@ -38,6 +48,7 @@ function Write-Step    { param($Msg) Write-Host "`n━━━ $Msg ━━━`n" -
 # ── 全局变量 ──
 
 $script:NodeBinDir = $null
+$script:NvmManaged = $false
 $script:RequiredNodeMajor = 22
 $script:Arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
 
@@ -97,6 +108,110 @@ function Pin-NodePath {
     }
 }
 
+function Ensure-NodePriority {
+    param([string]$NodeV22Dir)
+
+    # nvm 管理的 Node 不需要手动调整 PATH，nvm use 已处理
+    if ($script:NvmManaged) { return }
+
+    if (-not $NodeV22Dir -or -not (Test-Path (Join-Path $NodeV22Dir "node.exe"))) { return }
+
+    $machinePath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+    if (-not $machinePath) { return }
+    $machineDirs = $machinePath.Split(";") | Where-Object { $_ }
+
+    $hasConflict = $false
+    foreach ($dir in $machineDirs) {
+        if ($dir -eq $NodeV22Dir) { continue }
+        $nodeExe = Join-Path $dir "node.exe"
+        if (Test-Path $nodeExe) {
+            try {
+                $output = & $nodeExe -v 2>$null
+                if ($output -match "v(\d+)" -and [int]$Matches[1] -lt $script:RequiredNodeMajor) {
+                    $oldVer = $output.Trim()
+                    Write-Warn "检测到系统 PATH 中存在低版本 Node.js: $dir ($oldVer)"
+                    $hasConflict = $true
+                }
+            } catch {}
+        }
+    }
+
+    if (-not $hasConflict) { return }
+
+    # Machine PATH 已有 v22 在最前面则无需处理
+    if ($machineDirs[0] -eq $NodeV22Dir) { return }
+
+    Write-Info "正在将 Node.js v22 路径提升到系统 PATH 最前方..."
+
+    $newMachineDirs = @($NodeV22Dir) + ($machineDirs | Where-Object { $_ -ne $NodeV22Dir })
+    $newMachinePath = $newMachineDirs -join ";"
+
+    try {
+        [Environment]::SetEnvironmentVariable("PATH", $newMachinePath, "Machine")
+        Write-Ok "已将 Node.js v22 设为系统默认版本"
+    } catch {
+        Write-Info "需要管理员权限，正在请求..."
+        $escaped = $newMachinePath -replace "'", "''"
+        try {
+            Start-Process -FilePath "powershell.exe" `
+                -ArgumentList "-NoProfile -Command `"[Environment]::SetEnvironmentVariable('PATH','$escaped','Machine')`"" `
+                -Verb RunAs -Wait -WindowStyle Hidden
+            Write-Ok "已将 Node.js v22 设为系统默认版本"
+        } catch {
+            Write-Warn "未能修改系统 PATH（用户取消了管理员授权）"
+            Write-Info "正在修补 openclaw 启动脚本以使用正确的 Node.js 版本..."
+            Patch-OpenclawShim -NodeV22Dir $NodeV22Dir
+            return
+        }
+    }
+
+    Refresh-PathEnv
+    $env:PATH = "$NodeV22Dir;$env:PATH"
+}
+
+function Patch-OpenclawShim {
+    param([string]$NodeV22Dir)
+
+    $nodeExe = Join-Path $NodeV22Dir "node.exe"
+    if (-not (Test-Path $nodeExe)) { return }
+
+    $found = Find-OpenclawBinary
+    if (-not $found) { return }
+
+    $shimPath = $found.Path
+    if ($shimPath -notlike "*.cmd") { return }
+
+    try {
+        $content = Get-Content $shimPath -Raw -Encoding UTF8
+        if (-not $content) { return }
+
+        # 已经是完整路径则跳过
+        if ($content -like "*$nodeExe*") {
+            Write-Ok "openclaw 启动脚本已使用正确的 Node.js 路径"
+            return
+        }
+
+        # 替换裸 node 调用为完整路径
+        $patched = $content -replace '(?m)^(@?)node(\.exe)?\s', "`$1`"$nodeExe`" "
+        if ($patched -eq $content) {
+            $patched = $content -replace '(?m)"node(\.exe)?"\s', "`"$nodeExe`" "
+        }
+
+        if ($patched -ne $content) {
+            Set-Content -Path $shimPath -Value $patched -Encoding UTF8 -NoNewline
+            Write-Ok "已修补 openclaw 启动脚本 → $nodeExe"
+        } else {
+            Write-Warn "未能自动修补，openclaw.cmd 格式不符合预期"
+            Write-Host "  手动修复方法:" -ForegroundColor Yellow
+            Write-Host "    1. 打开「系统属性 → 高级 → 环境变量」" -ForegroundColor Yellow
+            Write-Host "    2. 在「系统变量」的 PATH 中，将 $NodeV22Dir 移到最前面" -ForegroundColor Yellow
+            Write-Host "    3. 或者卸载旧版本 Node.js 后重新打开终端" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Warn "修补 openclaw 启动脚本失败: $_"
+    }
+}
+
 function Get-NpmCmd {
     if ($script:NodeBinDir) {
         $cmd = Join-Path $script:NodeBinDir "npm.cmd"
@@ -120,21 +235,81 @@ function Get-PnpmCmd {
     return "pnpm.cmd"
 }
 
-function Get-OpenclawCmd {
-    # 优先查找 PNPM_HOME
-    if ($env:PNPM_HOME) {
-        $cmd = Join-Path $env:PNPM_HOME "openclaw.cmd"
-        if (Test-Path $cmd) { return $cmd }
-    }
-    # 查找 NodeBinDir
-    if ($script:NodeBinDir) {
-        $cmd = Join-Path $script:NodeBinDir "openclaw.cmd"
-        if (Test-Path $cmd) { return $cmd }
-    }
-    # 查找默认 pnpm 全局路径
+function Find-OpenclawBinary {
+    $searchDirs = @()
+
+    # pnpm bin -g（实际安装位置）
+    try {
+        $pnpmCmd = Get-PnpmCmd
+        $pnpmBin = (& $pnpmCmd bin -g 2>$null).Trim()
+        if ($pnpmBin -and (Test-Path $pnpmBin)) { $searchDirs += $pnpmBin }
+    } catch {}
+
+    # PNPM_HOME
+    if ($env:PNPM_HOME -and (Test-Path $env:PNPM_HOME)) { $searchDirs += $env:PNPM_HOME }
+
+    # 默认 pnpm 路径 + 全局 store 子目录
     $defaultPnpmHome = Join-Path (Get-LocalAppData) "pnpm"
-    $cmd = Join-Path $defaultPnpmHome "openclaw.cmd"
-    if (Test-Path $cmd) { return $cmd }
+    if (Test-Path $defaultPnpmHome) {
+        $searchDirs += $defaultPnpmHome
+        # pnpm 全局安装可能在 pnpm\global\<version>\node_modules\.bin
+        $pnpmGlobalDir = Join-Path $defaultPnpmHome "global"
+        if (Test-Path $pnpmGlobalDir) {
+            Get-ChildItem -Path $pnpmGlobalDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $binDir = Join-Path $_.FullName "node_modules\.bin"
+                if (Test-Path $binDir) { $searchDirs += $binDir }
+            }
+        }
+    }
+
+    # npm prefix -g（npm 全局安装路径）
+    try {
+        $npmCmd = Get-NpmCmd
+        $npmPrefix = (& $npmCmd prefix -g 2>$null).Trim()
+        if ($npmPrefix) {
+            if (Test-Path $npmPrefix) { $searchDirs += $npmPrefix }
+            $npmBin = Join-Path $npmPrefix "bin"
+            if (Test-Path $npmBin) { $searchDirs += $npmBin }
+        }
+    } catch {}
+
+    # %AppData%\npm（Windows npm 常见全局目录）
+    if ($env:APPDATA) {
+        $appDataNpm = Join-Path $env:APPDATA "npm"
+        if (Test-Path $appDataNpm) { $searchDirs += $appDataNpm }
+    }
+
+    # NodeBinDir
+    if ($script:NodeBinDir -and (Test-Path $script:NodeBinDir)) { $searchDirs += $script:NodeBinDir }
+
+    # where.exe 查找
+    try {
+        $whereResult = & where.exe openclaw 2>$null
+        if ($whereResult) {
+            $whereResult -split "`r?`n" | ForEach-Object {
+                $line = $_.Trim()
+                if ($line -and (Test-Path $line)) {
+                    $searchDirs += (Split-Path $line -Parent)
+                }
+            }
+        }
+    } catch {}
+
+    $searchDirs = $searchDirs | Where-Object { $_ } | Select-Object -Unique
+    foreach ($dir in $searchDirs) {
+        foreach ($name in @("openclaw.cmd", "openclaw.exe", "openclaw.ps1")) {
+            $candidate = Join-Path $dir $name
+            if (Test-Path $candidate) {
+                return @{ Path = $candidate; Dir = $dir }
+            }
+        }
+    }
+    return $null
+}
+
+function Get-OpenclawCmd {
+    $found = Find-OpenclawBinary
+    if ($found) { return $found.Path }
     return "openclaw"
 }
 
@@ -195,27 +370,52 @@ function Get-LatestNodeVersion {
 # ── 安装 Node.js ──
 
 function Install-NodeViaNvm {
+    $nvmExe = $null
     try {
-        $nvmOut = & cmd /c "nvm version" 2>$null
-        if (-not $nvmOut) { return $false }
-    } catch { return $false }
+        $nvmExe = (Get-Command nvm -ErrorAction Stop).Source
+    } catch {
+        try {
+            $nvmOut = & cmd /c "nvm version" 2>$null
+            if (-not $nvmOut) { return $false }
+        } catch { return $false }
+    }
 
-    Write-Info "检测到 nvm，正在使用 nvm 安装 Node.js v22..."
+    Write-Info "检测到 nvm-windows，正在使用 nvm 安装 Node.js v22..."
     try { & cmd /c "nvm node_mirror https://npmmirror.com/mirrors/node/" 2>$null } catch {}
 
-    try {
-        & cmd /c "nvm install 22" 2>$null
-        & cmd /c "nvm use 22" 2>$null
-        Refresh-PathEnv
+    try { & cmd /c "nvm install 22" 2>$null } catch {
+        Write-Warn "nvm install 22 失败: $_"
+        return $false
+    }
 
+    # nvm use 需要管理员权限（创建符号链接）
+    & cmd /c "nvm use 22" 2>$null
+    Refresh-PathEnv
+    $ver = Get-NodeVersion
+    if ($ver) {
+        Write-Ok "Node.js $ver 已通过 nvm 安装并切换"
+        $script:NvmManaged = $true
+        return $true
+    }
+
+    # nvm use 可能因权限不足失败，尝试提权
+    Write-Info "nvm use 需要管理员权限，正在请求..."
+    try {
+        Start-Process -FilePath "cmd.exe" `
+            -ArgumentList "/c nvm use 22" `
+            -Verb RunAs -Wait -WindowStyle Hidden
+        Refresh-PathEnv
         $ver = Get-NodeVersion
         if ($ver) {
-            Write-Ok "Node.js $ver 已通过 nvm 安装"
+            Write-Ok "Node.js $ver 已通过 nvm 安装并切换"
+            $script:NvmManaged = $true
             return $true
         }
     } catch {
-        Write-Warn "nvm 安装 Node.js 失败: $_"
+        Write-Warn "nvm use 提权失败（用户可能取消了授权）"
     }
+
+    Write-Warn "nvm 切换 Node.js 版本失败"
     return $false
 }
 
@@ -399,29 +599,79 @@ function Install-GitDirect {
 
 # ── 主流程步骤 ──
 
+function Test-NvmInstalled {
+    try { $null = & cmd /c "nvm version" 2>$null; return $true } catch {}
+    try { Get-Command nvm -ErrorAction Stop | Out-Null; return $true } catch {}
+    return $false
+}
+
+function Test-NvmNodeActive {
+    param([int]$Major)
+    try {
+        $list = & cmd /c "nvm list" 2>$null
+        if ($list -match "\*\s+$Major\.") { return $true }
+    } catch {}
+    return $false
+}
+
+function Use-NodeV22Dir {
+    param([string]$Dir)
+    $script:NodeBinDir = $Dir
+    $rest = ($env:PATH.Split(";") | Where-Object { $_ -ne $Dir }) -join ";"
+    $env:PATH = "$Dir;$rest"
+    Add-ToUserPath $Dir
+    Ensure-NodePriority -NodeV22Dir $Dir
+}
+
 function Step-CheckNode {
     Write-Step "步骤 1/7: 准备 Node.js 环境"
 
-    # 先检查脚本之前安装过的路径是否已有合格版本
+    $hasNvm = Test-NvmInstalled
+
+    # 如果有 nvm，优先尝试通过 nvm 管理 Node 版本
+    if ($hasNvm) {
+        Write-Info "检测到 nvm-windows..."
+
+        # 检查 nvm 当前激活的版本是否已经是 v22+
+        if (Test-NvmNodeActive -Major 22) {
+            $ver = Get-NodeVersion
+            if ($ver) {
+                Write-Ok "Node.js $ver 已通过 nvm 激活，版本满足要求 (>= 22)"
+                Pin-NodePath
+                $script:NvmManaged = $true
+                return $true
+            }
+        }
+
+        # nvm 没有激活 v22，尝试安装并切换
+        if (Install-NodeViaNvm) {
+            Pin-NodePath
+            return $true
+        }
+
+        # nvm 切换失败，尝试使用已有的 v22（之前直接安装的）
+        Write-Warn "nvm 切换 Node.js v22 失败（通常需要管理员权限）"
+        Write-Info "正在查找其他可用的 Node.js v22..."
+    }
+
+    # 检查脚本之前直接安装过的路径
     $scriptInstallDir = Join-Path (Get-LocalAppData) "nodejs"
     $scriptNodeExe = Join-Path $scriptInstallDir "node.exe"
     if (Test-Path $scriptNodeExe) {
         $ver = Get-NodeVersion -NodeExe $scriptNodeExe
         if ($ver) {
             Write-Ok "Node.js $ver 已安装，版本满足要求 (>= 22)"
-            $script:NodeBinDir = $scriptInstallDir
-            $rest = ($env:PATH.Split(";") | Where-Object { $_ -ne $scriptInstallDir }) -join ";"
-            $env:PATH = "$scriptInstallDir;$rest"
-            Add-ToUserPath $scriptInstallDir
+            Use-NodeV22Dir $scriptInstallDir
             return $true
         }
     }
 
-    # 再从 PATH 中查找合格版本
+    # 从 PATH 中查找合格版本
     $ver = Get-NodeVersion
     if ($ver) {
         Write-Ok "Node.js $ver 已安装，版本满足要求 (>= 22)"
         Pin-NodePath
+        if ($script:NodeBinDir) { Ensure-NodePriority -NodeV22Dir $script:NodeBinDir }
         return $true
     }
 
@@ -433,11 +683,20 @@ function Step-CheckNode {
     }
 
     Write-Info "正在自动安装 Node.js v22..."
-
-    if (Install-NodeViaNvm) { Pin-NodePath; return $true }
-    if (Install-NodeDirect) { Pin-NodePath; return $true }
+    if (Install-NodeDirect) {
+        Pin-NodePath
+        if ($script:NodeBinDir) { Ensure-NodePriority -NodeV22Dir $script:NodeBinDir }
+        return $true
+    }
 
     Write-Err "所有安装方式均失败，请检查网络连接后重试"
+    if ($hasNvm) {
+        Write-Host ""
+        Write-Host "  建议以管理员身份打开 PowerShell 后执行:" -ForegroundColor Yellow
+        Write-Host "    nvm install 22" -ForegroundColor Cyan
+        Write-Host "    nvm use 22" -ForegroundColor Cyan
+        Write-Host "  然后重新运行本安装脚本" -ForegroundColor Yellow
+    }
     return $false
 }
 
@@ -535,6 +794,18 @@ function Run-PnpmInstall {
         $psi.RedirectStandardError = $true
         $psi.CreateNoWindow = $true
 
+        # 确保子进程使用正确版本的 Node.js
+        if ($script:NodeBinDir) {
+            $childPath = $env:PATH
+            $cleanParts = $childPath.Split(";") | Where-Object {
+                if (-not $_) { return $false }
+                $nodeInDir = Join-Path $_ "node.exe"
+                if ((Test-Path $nodeInDir) -and ($_ -ne $script:NodeBinDir)) { return $false }
+                return $true
+            }
+            $psi.EnvironmentVariables["PATH"] = "$($script:NodeBinDir);$($cleanParts -join ';')"
+        }
+
         $proc = [System.Diagnostics.Process]::Start($psi)
         $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
         $stderrTask = $proc.StandardError.ReadToEndAsync()
@@ -618,16 +889,30 @@ function Step-InstallOpenClaw {
         return $false
     }
 
+    function On-InstallSuccess {
+        Write-Ok "OpenClaw 安装完成"
+        Refresh-PathEnv
+        Ensure-PnpmHome
+        $found = Find-OpenclawBinary
+        if ($found) {
+            Add-ToUserPath $found.Dir
+            Write-Info "OpenClaw 安装位置: $($found.Dir)"
+        } else {
+            try {
+                $pnpmBin = (& $pnpmCmd bin -g 2>$null).Trim()
+                if ($pnpmBin -and (Test-Path $pnpmBin)) {
+                    Add-ToUserPath $pnpmBin
+                    Write-Info "pnpm 全局 bin 目录: $pnpmBin"
+                }
+            } catch {}
+        }
+        return $true
+    }
+
     # 第 1 轮：使用官方 GitHub 地址（不走镜像）
     $result = Run-PnpmInstall -PnpmCmd $pnpmCmd -Label "安装"
-    if ($result.Success) {
-        Write-Ok "OpenClaw 安装完成"
-        return $true
-    }
-    if (Try-InstallWithCleanup $pnpmCmd ([ref]$result)) {
-        Write-Ok "OpenClaw 安装完成"
-        return $true
-    }
+    if ($result.Success) { return (On-InstallSuccess) }
+    if (Try-InstallWithCleanup $pnpmCmd ([ref]$result)) { return (On-InstallSuccess) }
 
     # 第 2 轮：官方失败，依次尝试镜像
     Write-Warn "官方源安装失败，正在尝试镜像加速..."
@@ -644,10 +929,7 @@ function Step-InstallOpenClaw {
             Write-Info "正在使用镜像 $mirror 重试..."
             $result = Run-PnpmInstall -PnpmCmd $pnpmCmd -Label "重试安装"
             Clear-GitMirror $mirror
-            if ($result.Success) {
-                Write-Ok "OpenClaw 安装完成 (通过镜像加速)"
-                return $true
-            }
+            if ($result.Success) { return (On-InstallSuccess) }
         } catch {
             Clear-GitMirror $mirror
         }
@@ -671,31 +953,56 @@ function Step-Verify {
     Refresh-PathEnv
     Ensure-PnpmHome
 
+    $found = Find-OpenclawBinary
+    if ($found) {
+        $binDir = $found.Dir
+        if ($env:PATH -notlike "*$binDir*") {
+            $env:PATH = "$binDir;$env:PATH"
+        }
+        Add-ToUserPath $binDir
+        Write-Info "OpenClaw 安装位置: $binDir"
+
+        $ver = $null
+        try { $ver = (& $found.Path -v 2>$null).Trim() } catch {}
+        if ($ver) {
+            Write-Ok "OpenClaw $ver 安装成功！"
+            Write-Host "`n  🦞 恭喜！你的龙虾已就位！`n" -ForegroundColor Green
+            return $true
+        }
+    }
+
+    # 再尝试 pnpm bin -g 兜底
     try {
         $pnpmCmd = Get-PnpmCmd
         $pnpmBin = (& $pnpmCmd bin -g 2>$null).Trim()
         if ($pnpmBin -and (Test-Path $pnpmBin)) {
-            if ($env:PATH -notlike "*$pnpmBin*") {
-                $env:PATH = "$pnpmBin;$env:PATH"
-                Add-ToUserPath $pnpmBin
-                Write-Info "已发现 pnpm 全局目录: $pnpmBin"
+            $env:PATH = "$pnpmBin;$env:PATH"
+            Add-ToUserPath $pnpmBin
+            Write-Info "已将 pnpm 全局 bin 目录添加到 PATH: $pnpmBin"
+
+            $openclawCmd = Join-Path $pnpmBin "openclaw.cmd"
+            if (Test-Path $openclawCmd) {
+                $ver = $null
+                try { $ver = (& $openclawCmd -v 2>$null).Trim() } catch {}
+                if ($ver) {
+                    Write-Ok "OpenClaw $ver 安装成功！"
+                    Write-Host "`n  🦞 恭喜！你的龙虾已就位！`n" -ForegroundColor Green
+                    return $true
+                }
             }
         }
     } catch {}
 
-    $openclawCmd = Get-OpenclawCmd
-    $ver = $null
-    try { $ver = & $openclawCmd -v 2>$null } catch {}
-    if (-not $ver) { try { $ver = & openclaw -v 2>$null } catch {} }
-
-    if ($ver) {
-        Write-Ok "OpenClaw $ver 安装成功！"
-        Write-Host "`n  🦞 恭喜！你的龙虾已就位！`n" -ForegroundColor Green
-        return $true
-    }
-
-    Write-Warn "未能验证 OpenClaw 安装，请尝试重新打开终端后执行 openclaw -v"
-    return $true
+    Write-Err "安装完成但无法找到 openclaw 可执行文件"
+    Write-Host ""
+    Write-Host "  请尝试以下步骤排查:" -ForegroundColor Yellow
+    Write-Host "    1. 关闭当前终端，打开一个新的 PowerShell 窗口" -ForegroundColor Yellow
+    Write-Host "    2. 运行 openclaw -v 检查是否可用" -ForegroundColor Yellow
+    Write-Host "    3. 如果仍然不可用，运行以下命令查看 pnpm 全局 bin 目录:" -ForegroundColor Yellow
+    Write-Host "       pnpm bin -g" -ForegroundColor Cyan
+    Write-Host "    4. 将输出的目录手动添加到系统 PATH 环境变量" -ForegroundColor Yellow
+    Write-Host ""
+    return $false
 }
 
 function Step-Onboard {
@@ -888,10 +1195,17 @@ function Main {
 
     Refresh-PathEnv
 
-    # 检测是否已安装
+    # 检测是否已安装（全面搜索）
     $existingVer = $null
-    try { $existingVer = & openclaw -v 2>$null } catch {}
+    $found = Find-OpenclawBinary
+    if ($found) {
+        try { $existingVer = (& $found.Path -v 2>$null).Trim() } catch {}
+    }
+    if (-not $existingVer) {
+        try { $existingVer = (& openclaw -v 2>$null).Trim() } catch {}
+    }
     if ($existingVer) {
+        if ($found) { Add-ToUserPath $found.Dir }
         Write-Ok "OpenClaw $existingVer 已安装，无需重复安装"
         Write-Host "`n  🦞 你的龙虾已就位！`n" -ForegroundColor Green
         $reconfig = (Read-Host "  是否要重新配置 OpenClaw? [y/N]").Trim()
@@ -906,7 +1220,7 @@ function Main {
     if (-not (Step-SetMirror))       { Write-Host "`n按任意键退出..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); return }
     if (-not (Step-InstallPnpm))     { Write-Host "`n按任意键退出..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); return }
     if (-not (Step-InstallOpenClaw)) { Write-Host "`n按任意键退出..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); return }
-    Step-Verify | Out-Null
+    if (-not (Step-Verify))          { Write-Host "`n按任意键退出..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); return }
     Step-Onboard | Out-Null
 
     Write-Host ""
